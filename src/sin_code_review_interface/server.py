@@ -1,123 +1,164 @@
-"""FastAPI-Server für das Review-Interface."""
-from __future__ import annotations
+"""Review server with FastAPI and ReviewServer.
 
-import json
-from pathlib import Path
-from typing import Optional
+Docs: server.py.doc.md
+"""
+import uuid
+from typing import Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
-from .visualizer import GraphVisualizer, SemanticDiffRenderer
-
-
-app = FastAPI(title="SIN-Code Review Interface")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from .comment import Comment
+from .decision import Decision
+from .diff import SemanticDiff
+from .storage import JSONStorage, ReviewData, SQLiteStorage, Storage
 
 
-class ReviewRequest(BaseModel):
-    file_a: str
-    file_b: str
-    repo_root: Optional[str] = "."
+class ReviewServer:
+    """Programmatic review server."""
+
+    def __init__(self, storage_path: str = "reviews.db"):
+        if storage_path.endswith(".json"):
+            self.storage: Storage = JSONStorage(storage_path)
+        else:
+            self.storage = SQLiteStorage(storage_path)
+
+    def create_review(self, title: str, diff: str, author: str,
+                      files_changed: Optional[List[str]] = None) -> ReviewData:
+        """Create a new review from diff text."""
+        review_id = str(uuid.uuid4())
+        if files_changed is None:
+            sd = SemanticDiff(diff)
+            files_changed = sd.get_files_changed()
+        review = ReviewData(
+            review_id=review_id,
+            title=title,
+            diff=diff,
+            author=author,
+            files_changed=files_changed
+        )
+        self.storage.create(review)
+        return review
+
+    def get_review(self, review_id: str) -> Optional[ReviewData]:
+        """Get a review by ID."""
+        return self.storage.get(review_id)
+
+    def list_reviews(self) -> List[ReviewData]:
+        """List all reviews."""
+        return self.storage.list()
+
+    def add_comment(self, review_id: str, body: str, author: str = "reviewer",
+                    file: Optional[str] = None, line: Optional[int] = None) -> Comment:
+        """Add a comment to a review."""
+        comment = Comment(
+            id=str(uuid.uuid4()),
+            review_id=review_id,
+            author=author,
+            body=body,
+            file=file,
+            line=line
+        )
+        self.storage.add_comment(review_id, comment)
+        return comment
+
+    def submit_decision(self, review_id: str, reviewer: str,
+                        decision: Decision) -> None:
+        """Submit a review decision."""
+        self.storage.add_decision(review_id, reviewer, decision.value)
+
+    def get_comments_for_review(self, review_id: str) -> List[Comment]:
+        """Get all comments for a review."""
+        review = self.storage.get(review_id)
+        if review:
+            return review.comments
+        return []
 
 
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    """Serve the main review UI."""
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>SIN-Code Review Interface</title>
-        <style>
-            body { font-family: system-ui; margin: 2rem; }
-            .diff { background: #f8f9fa; padding: 1rem; border-radius: 4px; }
-            .risk-high { border-left: 4px solid #dc3545; }
-            .risk-medium { border-left: 4px solid #ffc107; }
-            .risk-low { border-left: 4px solid #28a745; }
-        </style>
-    </head>
-    <body>
-        <h1>SIN-Code Semantic Review</h1>
-        <form id="reviewForm">
-            <input type="text" id="fileA" placeholder="File A path" required>
-            <input type="text" id="fileB" placeholder="File B path" required>
-            <button type="submit">Analyze</button>
-        </form>
-        <div id="results"></div>
-        <script>
-            document.getElementById('reviewForm').onsubmit = async (e) => {
-                e.preventDefault();
-                const res = await fetch('/api/review', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        file_a: document.getElementById('fileA').value,
-                        file_b: document.getElementById('fileB').value
-                    })
-                });
-                const data = await res.json();
-                document.getElementById('results').innerHTML =
-                    `<div class="diff risk-${data.risk.risk}">
-                        <h3>Risk: ${data.risk.risk} (${data.risk.score})</h3>
-                        ${data.intents.map(i =>
-                            `<p><strong>[${i.risk.toUpperCase()}]</strong> ${i.headline}</p>
-                             <p><em>${i.rationale}</em></p>`
-                        ).join('')}
-                    </div>`;
-            };
-        </script>
-    </body>
-    </html>
-    """
+# FastAPI app factory
 
+def get_app(storage_path: str = "reviews.db") -> FastAPI:
+    """Create and configure the FastAPI application."""
+    server = ReviewServer(storage_path=storage_path)
+    app = FastAPI(title="SIN Code Review Interface")
+    templates = Jinja2Templates(directory="src/sin_code_review_interface/templates")
 
-@app.post("/api/review")
-async def api_review(req: ReviewRequest):
-    """Semantic review endpoint."""
-    try:
-        from sin_code_ibd import ASTDiff, IntentSummarizer, RiskScorer
+    @app.get("/", response_class=HTMLResponse)
+    async def index(request: Request):
+        reviews = server.list_reviews()
+        return templates.TemplateResponse(request, "base.html", {"reviews": reviews})
 
-        ad = ASTDiff()
-        changes = ad.diff_files(req.file_a, req.file_b)
-        intents = IntentSummarizer().summarize(changes)
-        risk = RiskScorer().score(changes)
+    @app.post("/reviews")
+    async def create_review_endpoint(request: Request):
+        data = await request.json()
+        review = server.create_review(
+            title=data["title"],
+            diff=data["diff"],
+            author=data.get("author", "agent"),
+            files_changed=data.get("files_changed")
+        )
+        return {"id": review.id, "title": review.title, "author": review.author,
+                "files_changed": review.files_changed, "status": review.status}
 
-        return JSONResponse({
-            "intents": [i.__dict__ for i in intents],
-            "risk": risk,
+    @app.get("/reviews")
+    async def list_reviews_endpoint():
+        reviews = server.list_reviews()
+        return [{"id": r.id, "title": r.title, "author": r.author,
+                 "files_changed": r.files_changed, "status": r.status} for r in reviews]
+
+    @app.get("/reviews/{review_id}")
+    async def get_review_endpoint(review_id: str):
+        review = server.get_review(review_id)
+        if not review:
+            raise HTTPException(status_code=404, detail="Not found")
+        sd = SemanticDiff(review.diff)
+        return {
+            "id": review.id,
+            "title": review.title,
+            "author": review.author,
+            "files_changed": review.files_changed,
+            "status": review.status,
+            "diff": review.diff,
+            "side_by_side": sd.render_side_by_side(),
+            "comments": [
+                {"id": c.id, "author": c.author, "body": c.body,
+                 "file": c.file, "line": c.line, "created_at": c.created_at}
+                for c in review.comments
+            ],
+            "decisions": review.decisions
+        }
+
+    @app.post("/reviews/{review_id}/comments")
+    async def add_comment_endpoint(review_id: str, request: Request):
+        data = await request.json()
+        comment = server.add_comment(
+            review_id=review_id,
+            body=data["body"],
+            author=data.get("author", "reviewer"),
+            file=data.get("file"),
+            line=data.get("line")
+        )
+        return {"id": comment.id, "author": comment.author, "body": comment.body,
+                "file": comment.file, "line": comment.line}
+
+    @app.post("/reviews/{review_id}/decisions")
+    async def submit_decision_endpoint(review_id: str, request: Request):
+        data = await request.json()
+        decision = Decision(data.get("decision", "comment"))
+        server.submit_decision(review_id, data.get("reviewer", "human"), decision)
+        return {"review_id": review_id, "reviewer": data.get("reviewer", "human"), "decision": decision.value}
+
+    @app.get("/reviews/{review_id}/ui", response_class=HTMLResponse)
+    async def review_ui(request: Request, review_id: str):
+        review = server.get_review(review_id)
+        if not review:
+            return HTMLResponse("<h1>Review not found</h1>", status_code=404)
+        sd = SemanticDiff(review.diff)
+        return templates.TemplateResponse(request, "review.html", {
+            "review": review,
+            "side_by_side": sd.render_side_by_side()
         })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/api/graph/{symbol_fqid}")
-async def graph_view(symbol_fqid: str, repo_root: str = Query(".")):
-    """Return knowledge graph view for a symbol."""
-    try:
-        from sin_code_sckg.graph import KnowledgeGraph
-        kg = KnowledgeGraph(storage_path=f"{repo_root}/.sin/knowledge.graph")
-
-        if not kg.graph.has_node(symbol_fqid):
-            raise HTTPException(status_code=404, detail="Symbol not found")
-
-        visualizer = GraphVisualizer(kg.graph)
-        return JSONResponse(visualizer.render_subgraph(symbol_fqid, depth=2))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+    return app
