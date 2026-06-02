@@ -3,6 +3,7 @@
 Docs: storage.doc.md
 """
 import json
+import logging
 import sqlite3
 import uuid
 from pathlib import Path
@@ -175,7 +176,11 @@ class JSONStorage(Storage):
         if self.path.exists():
             text = self.path.read_text()
             if text.strip():
-                self._data = json.loads(text)
+                try:
+                    self._data = json.loads(text)
+                except json.JSONDecodeError as e:
+                    logging.warning("Corrupted JSON in %s: %s", self.path, e)
+                    self._data = {}
 
     def _save(self) -> None:
         self.path.write_text(json.dumps(self._data, indent=2))

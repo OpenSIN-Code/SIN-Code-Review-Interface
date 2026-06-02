@@ -67,6 +67,8 @@ class ReviewServer:
     def submit_decision(self, review_id: str, reviewer: str,
                         decision: Decision) -> None:
         """Submit a review decision."""
+        if isinstance(decision, str):
+            decision = Decision(decision)
         self.storage.add_decision(review_id, reviewer, decision.value)
 
     def get_comments_for_review(self, review_id: str) -> List[Comment]:
