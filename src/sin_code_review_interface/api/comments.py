@@ -1,6 +1,6 @@
 """Comment API routes.
 
-Docs: api/comments.doc.md
+Docs: comments.doc.md
 """
 from fastapi import APIRouter, Request
 

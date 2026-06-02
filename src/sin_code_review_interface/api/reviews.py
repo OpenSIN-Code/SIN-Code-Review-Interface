@@ -1,6 +1,6 @@
 """Review API routes.
 
-Docs: api/reviews.doc.md
+Docs: reviews.doc.md
 """
 from fastapi import APIRouter, Request
 from sin_code_review_interface.server import ReviewServer

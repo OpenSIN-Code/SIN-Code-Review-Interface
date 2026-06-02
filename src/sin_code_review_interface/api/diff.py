@@ -1,6 +1,6 @@
 """Diff API routes.
 
-Docs: api/diff.doc.md
+Docs: diff.doc.md
 """
 from fastapi import APIRouter, Request
 from sin_code_review_interface.diff import SemanticDiff

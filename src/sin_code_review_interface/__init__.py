@@ -1,6 +1,6 @@
 """SIN Code Review Interface — human-centered review of agent-generated code.
 
-Docs: __init__.doc.md
+Docs: __init__.py.doc.md
 """
 from .server import ReviewServer, get_app
 from .decision import Decision
