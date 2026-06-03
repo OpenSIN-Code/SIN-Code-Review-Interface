@@ -2,6 +2,7 @@
 
 Docs: server.py.doc.md
 """
+import html
 import uuid
 from typing import Dict, List, Optional
 
@@ -53,6 +54,8 @@ class ReviewServer:
     def add_comment(self, review_id: str, body: str, author: str = "reviewer",
                     file: Optional[str] = None, line: Optional[int] = None) -> Comment:
         """Add a comment to a review."""
+        if len(body) > 65536:  # 64KB limit
+            raise ValueError("Comment body exceeds 64KB limit")
         comment = Comment(
             id=str(uuid.uuid4()),
             review_id=review_id,
@@ -125,7 +128,7 @@ def get_app(storage_path: str = "reviews.db") -> FastAPI:
             "diff": review.diff,
             "side_by_side": sd.render_side_by_side(),
             "comments": [
-                {"id": c.id, "author": c.author, "body": c.body,
+                {"id": c.id, "author": html.escape(c.author), "body": html.escape(c.body),
                  "file": c.file, "line": c.line, "created_at": c.created_at}
                 for c in review.comments
             ],
@@ -142,7 +145,7 @@ def get_app(storage_path: str = "reviews.db") -> FastAPI:
             file=data.get("file"),
             line=data.get("line")
         )
-        return {"id": comment.id, "author": comment.author, "body": comment.body,
+        return {"id": comment.id, "author": html.escape(comment.author), "body": html.escape(comment.body),
                 "file": comment.file, "line": comment.line}
 
     @app.post("/reviews/{review_id}/decisions")
