@@ -15,7 +15,7 @@ class Comment:
     author: str
     body: str
     file: Optional[str] = None
-    line: Optional[int] = None
+    line: Optional[int] = 0
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 

@@ -52,7 +52,7 @@ class ReviewServer:
         return self.storage.list()
 
     def add_comment(self, review_id: str, body: str, author: str = "reviewer",
-                    file: Optional[str] = None, line: Optional[int] = None) -> Comment:
+                    file: Optional[str] = None, line: Optional[int] = 0) -> Comment:
         """Add a comment to a review."""
         if len(body) > 65536:  # 64KB limit
             raise ValueError("Comment body exceeds 64KB limit")
@@ -72,6 +72,8 @@ class ReviewServer:
         """Submit a review decision."""
         if isinstance(decision, str):
             decision = Decision(decision)
+        if not self.storage.get(review_id):
+            raise ValueError(f"Review not found: {review_id}")
         self.storage.add_decision(review_id, reviewer, decision.value)
 
     def get_comments_for_review(self, review_id: str) -> List[Comment]:
