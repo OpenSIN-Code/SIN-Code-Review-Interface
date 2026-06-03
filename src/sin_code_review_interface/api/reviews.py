@@ -1,5 +1,10 @@
 """Review API routes.
 
+The complete review CRUD surface: create, list, get, add-comment,
+submit-decision. Equivalent routes also exist in `server.py` for
+standalone uvicorn use; this module is for users who want to mount
+the API under a custom prefix (e.g. `/api`).
+
 Docs: reviews.doc.md
 """
 from fastapi import APIRouter, Request
@@ -13,6 +18,10 @@ router = APIRouter()
 
 @router.post("/reviews")
 async def create_review(request: Request):
+    """Create a new review from a unified diff.
+
+    Body: `{"title", "diff", "author"?="agent", "files_changed"?=[...]}`.
+    """
     server: ReviewServer = request.app.state.review_server
     data = await request.json()
     review = server.create_review(
@@ -26,6 +35,7 @@ async def create_review(request: Request):
 
 @router.get("/reviews")
 async def list_reviews(request: Request):
+    """List all reviews (no pagination)."""
     server: ReviewServer = request.app.state.review_server
     reviews = server.list_reviews()
     return [{"id": r.id, "title": r.title, "author": r.author,
@@ -33,11 +43,18 @@ async def list_reviews(request: Request):
 
 @router.get("/reviews/{review_id}")
 async def get_review(review_id: str, request: Request):
+    """Get a single review with parsed side-by-side diff and comments.
+
+    Returns `({"error": "Not found"}, 404)` for unknown IDs.
+    """
     from sin_code_review_interface.diff import SemanticDiff
     server: ReviewServer = request.app.state.review_server
     review = server.get_review(review_id)
     if not review:
         return {"error": "Not found"}, 404
+    # Re-parse the diff on every read. The diff is small and SQLite
+    # doesn't store the parsed structure — re-parsing is cheaper than
+    # caching it.
     sd = SemanticDiff(review.diff)
     return {
         "id": review.id,
@@ -57,6 +74,10 @@ async def get_review(review_id: str, request: Request):
 
 @router.post("/reviews/{review_id}/comments")
 async def add_comment(review_id: str, request: Request):
+    """Add a comment to a review.
+
+    Body: `{"body", "author"?="reviewer", "file"?=null, "line"?=null}`.
+    """
     server: ReviewServer = request.app.state.review_server
     data = await request.json()
     comment = server.add_comment(
@@ -71,6 +92,10 @@ async def add_comment(review_id: str, request: Request):
 
 @router.post("/reviews/{review_id}/decisions")
 async def submit_decision(review_id: str, request: Request):
+    """Submit a review decision (approve / request_changes / comment).
+
+    Body: `{"decision", "reviewer"?="human"}`.
+    """
     server: ReviewServer = request.app.state.review_server
     data = await request.json()
     decision = Decision(data.get("decision", "comment"))

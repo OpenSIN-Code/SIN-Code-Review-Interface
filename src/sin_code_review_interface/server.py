@@ -1,6 +1,14 @@
 """Review server with FastAPI and ReviewServer.
 
-Docs: server.py.doc.md
+Two layers:
+  - `ReviewServer`: programmatic review CRUD (no HTTP).
+  - `get_app()`:    FastAPI app factory that wires `ReviewServer` to a
+                    JSON API and HTML UI.
+
+Storage is auto-selected from the path: `.json` → `JSONStorage`,
+anything else → `SQLiteStorage`.
+
+Docs: server.doc.md
 """
 import html
 import uuid
@@ -17,10 +25,17 @@ from .diff import SemanticDiff
 from .storage import JSONStorage, ReviewData, SQLiteStorage, Storage
 
 
+# ── ReviewServer (programmatic) ────────────────────────────────────────
 class ReviewServer:
-    """Programmatic review server."""
+    """Programmatic review server (no HTTP).
+
+    Backed by a `Storage` (SQLite by default, JSON for tests). Construct
+    with the storage path; everything else is method calls.
+    """
 
     def __init__(self, storage_path: str = "reviews.db"):
+        # Storage selection is path-based: `.json` → JSONStorage, else SQLite.
+        # SQLite is the default because it gives ACID semantics for free.
         if storage_path.endswith(".json"):
             self.storage: Storage = JSONStorage(storage_path)
         else:
@@ -28,9 +43,21 @@ class ReviewServer:
 
     def create_review(self, title: str, diff: str, author: str,
                       files_changed: Optional[List[str]] = None) -> ReviewData:
-        """Create a new review from diff text."""
+        """Create a new review from a unified diff.
+
+        Args:
+            title: Human-readable title.
+            diff: Unified diff text.
+            author: Who created the review.
+            files_changed: Optional explicit list. Inferred from the diff
+                           if not provided (via `SemanticDiff`).
+
+        Returns:
+            The created ReviewData (also persisted to storage).
+        """
         review_id = str(uuid.uuid4())
         if files_changed is None:
+            # Parse the diff to extract changed-file paths automatically.
             sd = SemanticDiff(diff)
             files_changed = sd.get_files_changed()
         review = ReviewData(
@@ -44,16 +71,32 @@ class ReviewServer:
         return review
 
     def get_review(self, review_id: str) -> Optional[ReviewData]:
-        """Get a review by ID."""
+        """Get a review by ID. Returns `None` if not found."""
         return self.storage.get(review_id)
 
     def list_reviews(self) -> List[ReviewData]:
-        """List all reviews."""
+        """List all reviews (no pagination)."""
         return self.storage.list()
 
     def add_comment(self, review_id: str, body: str, author: str = "reviewer",
                     file: Optional[str] = None, line: Optional[int] = 0) -> Comment:
-        """Add a comment to a review."""
+        """Add a comment to a review.
+
+        Args:
+            review_id: Target review UUID.
+            body: Comment text. Max 64 KB — see the limit check below.
+            author: Comment author (default: "reviewer").
+            file: Optional file path to anchor the comment on.
+            line: Optional line number to anchor the comment on.
+
+        Returns:
+            The created Comment (also persisted).
+
+        Raises:
+            ValueError: if `body` is over 64 KB.
+        """
+        # 64 KB matches the GitHub comment body limit. Larger pastes
+        # should use a code-hosting tool, not a comment thread.
         if len(body) > 65536:  # 64KB limit
             raise ValueError("Comment body exceeds 64KB limit")
         comment = Comment(
@@ -69,7 +112,17 @@ class ReviewServer:
 
     def submit_decision(self, review_id: str, reviewer: str,
                         decision: Decision) -> None:
-        """Submit a review decision."""
+        """Submit a review decision.
+
+        Args:
+            review_id: Target review UUID.
+            reviewer: Name of the reviewer.
+            decision: A `Decision` enum value (or string; coerced below).
+
+        Raises:
+            ValueError: if the review doesn't exist.
+        """
+        # Accept both enum and string — MCP clients pass strings.
         if isinstance(decision, str):
             decision = Decision(decision)
         if not self.storage.get(review_id):
@@ -77,17 +130,22 @@ class ReviewServer:
         self.storage.add_decision(review_id, reviewer, decision.value)
 
     def get_comments_for_review(self, review_id: str) -> List[Comment]:
-        """Get all comments for a review."""
+        """Return all comments for a review (or [] if the review doesn't exist)."""
         review = self.storage.get(review_id)
         if review:
             return review.comments
         return []
 
 
-# FastAPI app factory
+# ── FastAPI app factory ────────────────────────────────────────────────
 
 def get_app(storage_path: str = "reviews.db") -> FastAPI:
-    """Create and configure the FastAPI application."""
+    """Create and configure the FastAPI application.
+
+    The factory pattern lets tests instantiate a fresh app with an
+    isolated storage path. Don't use the module-level FastAPI instance
+    in tests; use this function instead.
+    """
     server = ReviewServer(storage_path=storage_path)
     app = FastAPI(title="SIN Code Review Interface")
     templates = Jinja2Templates(directory="src/sin_code_review_interface/templates")
@@ -119,8 +177,11 @@ def get_app(storage_path: str = "reviews.db") -> FastAPI:
     async def get_review_endpoint(review_id: str):
         review = server.get_review(review_id)
         if not review:
+            # 404 with a structured body so clients can show a useful error.
             raise HTTPException(status_code=404, detail="Not found")
         sd = SemanticDiff(review.diff)
+        # `html.escape` on author/body prevents stored XSS — the diff/comments
+        # can come from untrusted agents and the UI renders them as HTML.
         return {
             "id": review.id,
             "title": review.title,
@@ -161,6 +222,7 @@ def get_app(storage_path: str = "reviews.db") -> FastAPI:
     async def review_ui(request: Request, review_id: str):
         review = server.get_review(review_id)
         if not review:
+            # Render a minimal 404 page directly (no template needed for this).
             return HTMLResponse("<h1>Review not found</h1>", status_code=404)
         sd = SemanticDiff(review.diff)
         return templates.TemplateResponse(request, "review.html", {

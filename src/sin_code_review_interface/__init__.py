@@ -1,6 +1,9 @@
 """SIN Code Review Interface — human-centered review of agent-generated code.
 
-Docs: __init__.py.doc.md
+Re-exports the public API: `ReviewServer`, `get_app`, `Decision`, `SemanticDiff`,
+`Comment`, `Thread`. See `server.doc.md` for the high-level architecture.
+
+Docs: __init__.doc.md
 """
 from .server import ReviewServer, get_app
 from .decision import Decision

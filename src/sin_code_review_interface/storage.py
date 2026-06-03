@@ -1,5 +1,13 @@
 """Storage backends for reviews.
 
+Three pieces:
+  - `ReviewData`: in-memory representation of a review.
+  - `Storage`:     abstract interface (create / get / list / add_comment / add_decision).
+  - `SQLiteStorage` / `JSONStorage`: two concrete implementations.
+
+The server picks the backend by file extension (`.json` → JSON,
+otherwise SQLite).
+
 Docs: storage.doc.md
 """
 import json
@@ -13,8 +21,13 @@ from .comment import Comment
 from .decision import Decision
 
 
+# ── Data model ─────────────────────────────────────────────────────────
 class ReviewData:
-    """In-memory representation of a review."""
+    """In-memory representation of a review.
+
+    Comments and decisions are loaded eagerly when the review is read
+    from storage; they're mutable lists/dicts on this object.
+    """
     def __init__(self, review_id: str, title: str, diff: str, author: str,
                  files_changed: List[str], status: str = Decision.PENDING):
         self.id = review_id
@@ -28,31 +41,52 @@ class ReviewData:
         self.created_at = None
 
 
+# ── Abstract interface ─────────────────────────────────────────────────
 class Storage:
-    """Abstract storage interface."""
+    """Abstract storage interface.
+
+    Subclasses must implement all five methods. The interface is
+    deliberately narrow — anything more complex (transactions, indexes)
+    belongs in a subclass.
+    """
     def create(self, review: ReviewData) -> None:
+        """Persist a new review."""
         raise NotImplementedError
 
     def get(self, review_id: str) -> Optional[ReviewData]:
+        """Fetch a review by ID; return `None` if not found."""
         raise NotImplementedError
 
     def list(self) -> List[ReviewData]:
+        """List all reviews (no pagination)."""
         raise NotImplementedError
 
     def add_comment(self, review_id: str, comment: Comment) -> None:
+        """Append a comment to an existing review."""
         raise NotImplementedError
 
     def add_decision(self, review_id: str, reviewer: str, decision: str) -> None:
+        """Record a reviewer's decision; updates the review's status too."""
         raise NotImplementedError
 
 
+# ── SQLite backend ─────────────────────────────────────────────────────
 class SQLiteStorage(Storage):
-    """SQLite-backed persistent storage."""
+    """SQLite-backed persistent storage (default for production)."""
     def __init__(self, path: str = "reviews.db"):
         self.path = path
         self._init_db()
 
     def _init_db(self) -> None:
+        """Create the three tables if they don't already exist.
+
+        Schema:
+          - reviews:    one row per review (id is the primary key).
+          - comments:   many rows per review, joined by review_id.
+          - decisions:  one row per (review_id, reviewer) pair; the
+                        composite primary key means a reviewer can change
+                        their decision by submitting again.
+        """
         conn = sqlite3.connect(self.path)
         cursor = conn.cursor()
         cursor.execute("""
@@ -91,6 +125,7 @@ class SQLiteStorage(Storage):
     def create(self, review: ReviewData) -> None:
         conn = sqlite3.connect(self.path)
         cursor = conn.cursor()
+        # `files_changed` is a list — JSON-encoded into a TEXT column.
         cursor.execute(
             "INSERT INTO reviews (id, title, diff, author, files_changed, status) VALUES (?, ?, ?, ?, ?, ?)",
             (review.id, review.title, review.diff, review.author,
@@ -115,6 +150,9 @@ class SQLiteStorage(Storage):
             files_changed=json.loads(row[4]),
             status=row[5]
         )
+        # Load comments and decisions in the same connection so we see a
+        # consistent snapshot (SQLite default isolation is serializable
+        # within a connection).
         cursor.execute("SELECT id, review_id, author, body, file, line, created_at FROM comments WHERE review_id=?", (review_id,))
         for crow in cursor.fetchall():
             review.comments.append(Comment(
@@ -159,17 +197,25 @@ class SQLiteStorage(Storage):
     def add_decision(self, review_id: str, reviewer: str, decision: str) -> None:
         conn = sqlite3.connect(self.path)
         cursor = conn.cursor()
+        # `INSERT OR REPLACE` because a reviewer can change their mind —
+        # the (review_id, reviewer) composite primary key handles upsert.
         cursor.execute(
             "INSERT OR REPLACE INTO decisions (review_id, reviewer, decision) VALUES (?, ?, ?)",
             (review_id, reviewer, decision)
         )
+        # Also bump the review's overall status to the latest decision.
         cursor.execute("UPDATE reviews SET status=? WHERE id=?", (decision, review_id))
         conn.commit()
         conn.close()
 
 
+# ── JSON backend ───────────────────────────────────────────────────────
 class JSONStorage(Storage):
-    """JSON-file-backed storage for testing."""
+    """JSON-file-backed storage. Convenient for tests and small deployments.
+
+    NOT suitable for concurrent access — every method reads-modify-writes
+    the whole file. Use SQLite for production.
+    """
     def __init__(self, path: str = "reviews.json"):
         self.path = Path(path)
         self._data: Dict[str, dict] = {}
@@ -179,10 +225,13 @@ class JSONStorage(Storage):
                 try:
                     self._data = json.loads(text)
                 except json.JSONDecodeError as e:
+                    # Corrupted file — log and start fresh rather than crash.
+                    # The user can restore from backup if they have one.
                     logging.warning("Corrupted JSON in %s: %s", self.path, e)
                     self._data = {}
 
     def _save(self) -> None:
+        """Persist the in-memory dict to disk (pretty-printed)."""
         self.path.write_text(json.dumps(self._data, indent=2))
 
     def create(self, review: ReviewData) -> None:
@@ -210,14 +259,18 @@ class JSONStorage(Storage):
             files_changed=raw["files_changed"],
             status=raw["status"]
         )
+        # `**c` works because Comment's field names match the JSON keys.
         review.comments = [Comment(**c) for c in raw.get("comments", [])]
         review.decisions = raw.get("decisions", {})
         return review
 
     def list(self) -> List[ReviewData]:
+        # `self.get(rid)` filters out None defensively (e.g. corrupt rows).
         return [self.get(rid) for rid in self._data if self.get(rid) is not None]
 
     def add_comment(self, review_id: str, comment: Comment) -> None:
+        # Silently ignore comments on unknown reviews — caller (the server)
+        # is supposed to validate the review_id first.
         if review_id not in self._data:
             return
         self._data[review_id]["comments"].append({
@@ -234,6 +287,7 @@ class JSONStorage(Storage):
     def add_decision(self, review_id: str, reviewer: str, decision: str) -> None:
         if review_id not in self._data:
             return
+        # Two writes: the per-reviewer decision AND the rollup status.
         self._data[review_id]["decisions"][reviewer] = decision
         self._data[review_id]["status"] = decision
         self._save()

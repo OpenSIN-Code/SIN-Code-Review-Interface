@@ -1,4 +1,11 @@
-"""MCP server for agent integration.
+"""MCP-compatible wrapper around the ReviewServer.
+
+This module is a thin adapter that exposes the review server's operations
+in the Model Context Protocol's tool-call shape. It does NOT use
+`mcp.server.fastmcp` directly — instead, it returns tool definitions
+(`get_tools()`) and dispatches via `invoke_tool(name, arguments)`. An
+MCP client can drive it over any transport that supports those two
+calls (e.g. stdio JSON-RPC, HTTP RPC).
 
 Docs: mcp_server.doc.md
 """
@@ -7,10 +14,19 @@ from sin_code_review_interface.server import ReviewServer
 from sin_code_review_interface.decision import Decision
 
 
+# ── MCP server class ───────────────────────────────────────────────────
 class MCPReviewServer:
-    """MCP-compatible server exposing review tools."""
+    """MCP-compatible server exposing review tools.
+
+    Wraps a `ReviewServer` and adds the tool schema (`get_tools`) and
+    dispatcher (`invoke_tool`) that MCP needs. Each tool maps 1:1 to a
+    method on this class.
+    """
 
     def __init__(self, storage_path: str = "reviews.db"):
+        # Default storage path is the same SQLite file the standalone
+        # server uses; this means a running `sin-review serve` and an
+        # MCP client can share state.
         self.server = ReviewServer(storage_path=storage_path)
 
     def create_review(self, title: str, diff: str, author: str = "agent",
@@ -24,7 +40,7 @@ class MCPReviewServer:
             files_changed: Optional list of files; inferred from diff if omitted.
 
         Returns:
-            dict with review id, title, and status.
+            dict with review id, title, author, files_changed, status.
         """
         review = self.server.create_review(title=title, diff=diff, author=author, files_changed=files_changed)
         return {
@@ -47,7 +63,7 @@ class MCPReviewServer:
             line: Line number (optional).
 
         Returns:
-            dict with comment id.
+            dict with comment id, review_id, author, body, file, line.
         """
         comment = self.server.add_comment(review_id=review_id, body=body, author=author, file=file, line=line)
         return {
@@ -63,7 +79,7 @@ class MCPReviewServer:
         """List all reviews with status PENDING.
 
         Returns:
-            List of review dicts.
+            List of review dicts (id, title, author, files_changed, status).
         """
         reviews = self.server.list_reviews()
         return [
@@ -78,10 +94,14 @@ class MCPReviewServer:
         Args:
             review_id: Target review UUID.
             reviewer: Name of the reviewer.
-            decision: One of approve, request_changes, comment.
+            decision: One of `approve`, `request_changes`, `comment`.
 
         Returns:
             dict with review_id, reviewer, decision.
+
+        Raises:
+            ValueError: if `decision` is not a valid Decision value
+                        (Decision("...") raises on bad input).
         """
         d = Decision(decision)
         self.server.submit_decision(review_id, reviewer, d)
@@ -91,8 +111,15 @@ class MCPReviewServer:
             "decision": d.value
         }
 
+    # ── MCP dispatch ───────────────────────────────────────────────────
     def get_tools(self) -> List[Dict[str, Any]]:
-        """Return MCP tool definitions."""
+        """Return the JSON-Schema tool definitions MCP clients need.
+
+        The four tools are: `create_review`, `add_comment`,
+        `list_pending_reviews`, `submit_decision`. Each definition
+        includes a JSON-Schema for the parameters so clients can
+        validate input before calling.
+        """
         return [
             {
                 "name": "create_review",
@@ -147,7 +174,18 @@ class MCPReviewServer:
         ]
 
     def invoke_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
-        """Invoke a tool by name."""
+        """Dispatch a tool call to the matching method.
+
+        Args:
+            name: Tool name (must be in `get_tools()`).
+            arguments: Dict of arguments matching the tool's JSON-Schema.
+
+        Returns:
+            Whatever the wrapped method returns.
+
+        Raises:
+            ValueError: if `name` is not a known tool.
+        """
         if name == "create_review":
             return self.create_review(**arguments)
         elif name == "add_comment":
